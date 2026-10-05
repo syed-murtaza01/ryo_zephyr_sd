@@ -1,0 +1,11 @@
+declare -r ATF_REPO="https://github.com/altera-innersource/applications.fpga.soc.arm-trusted-firmware-dev"
+# declare -r ATF_REPO="github:altera-innersource/applications.fpga.soc.arm-trusted-firmware-dev.git"
+declare -r ATF_BRANCH="socfpga_v2.14.1"
+declare -r ATF_DIR="arm-trusted-firmware"
+
+declare -r ZEPHYR_REPO="https://github.com/altera-collab/os.rtos.zephyr.socfpga.zephyr-socfpga.git"
+# declare -r ZEPHYR_REPO="github:altera-collab/os.rtos.zephyr.socfpga.zephyr-socfpga.git"
+declare -r ZEPHYR_BRANCH="socfpga_v4.3.0"
+declare -r ZEPHYR_DIR="zephyr-socfpga"
+declare -r ZEPHYR_BOARD="intel_socfpga_agilex5_socdk"
+declare -r ZEPHYR_SAMPLE="samples/boards/intel_socfpga/cli"
