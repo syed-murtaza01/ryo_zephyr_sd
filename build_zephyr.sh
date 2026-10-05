@@ -15,12 +15,15 @@
 #   sdcard.img - Ready to write to SD card
 #
 # REQUIREMENTS:
-# - Linux host system (Ubuntu 22.04+ recommended)
+# - Linux x86_64 host (Ubuntu 22.04+ recommended for the Zephyr SDK)
 # - Internet connection for downloading sources
 # - ~20GB free disk space
 # - guestfs-tools for SD image creation
 # - Zephyr dependencies as listed
 #    on https://docs.zephyrproject.org/latest/develop/getting_started/installation_linux.html
+# - ATF compiler: the site Arm GNU toolchain when that gcc runs, otherwise
+#   Arm GNU Toolchain 13.3.Rel1 downloaded from Arm (CentOS 7 build, so it
+#   also runs on hosts older than Ubuntu 22.04)
 #
 # =============================================================================
 
@@ -40,10 +43,15 @@ JOBS=$(nproc)
 
 declare -r ZCFG_FILE="zcfg.sh"
 
-# Component URLs and settings
-# Using the musl compiler to make a tight, statically linked Linux environment
-declare -r TOOLCHAIN_URL="https://github.com/cross-tools/musl-cross/releases/download/20250929/aarch64-unknown-linux-musl.tar.xz"
-declare -r TOOLCHAIN_DIR="aarch64-unknown-linux-musl"
+# ATF cross compiler. Same prefix as the site tools: aarch64-none-linux-gnu-.
+# ATF_TOOLCHAIN_BIN overrides the site directory (use a missing path to force
+# the download). The package is the x86_64-hosted Arm GNU Toolchain 13.3.Rel1,
+# built on CentOS 7.
+declare -r SITE_TC_BIN="${ATF_TOOLCHAIN_BIN:-/nfs/site/disks/psg_ctools_1/arm_gnu/linaro/aarch64/13.3/1/bin}"
+declare -r ARM_GNU_TRIPLE="aarch64-none-linux-gnu"
+declare -r ARM_GNU_VER="13.3.rel1"
+declare -r ARM_GNU_DIR="arm-gnu-toolchain-${ARM_GNU_VER}-x86_64-${ARM_GNU_TRIPLE}"
+declare -r ARM_GNU_URL="https://developer.arm.com/-/media/Files/downloads/gnu/${ARM_GNU_VER}/binrel/${ARM_GNU_DIR}.tar.xz"
 
 declare -r SZ_KB=1024
 declare -r SZ_MB=$((${SZ_KB}*${SZ_KB}))
@@ -56,12 +64,27 @@ declare -r SDCARD_A2_SIZE=$((16*${SZ_MB}))
 # =============================================================================
 # HELPERS AND FUNCTIONS
 # =============================================================================
+# Internal hosts reach GitHub and Arm through the DMZ proxy. An already-set
+# proxy is left alone. The DMZ proxy is used only when its name resolves, so
+# a host outside this network keeps a direct connection.
+function ensure_download_proxy() {
+    if [[ -n "${https_proxy:-}${HTTPS_PROXY:-}${http_proxy:-}${HTTP_PROXY:-}" ]]; then
+        return 0
+    fi
+    if getent hosts proxy-dmz.altera.com >/dev/null 2>&1; then
+        export http_proxy="http://proxy-dmz.altera.com:912"
+        export https_proxy="http://proxy-dmz.altera.com:912"
+    fi
+}
+
 # download <url> <local file name>
 function download() {
 
     local archive="${2}"
     local url="${1}"
     local err=0
+
+    ensure_download_proxy
 
     if command -v wget >/dev/null 2>&1; then
         wget --no-check-certificate --progress=bar:force:noscroll -O "${archive}" "${url}"
@@ -75,6 +98,66 @@ function download() {
     fi  
 
     return ${err}
+}
+
+# True when this gcc binary exists and the dynamic linker can start it.
+function gcc_runs() {
+    [[ -n "${1}" && -x "${1}" ]] || return 1
+    "${1}" --version >/dev/null 2>&1
+}
+
+# Site Arm GNU toolchain when it runs; otherwise download Arm GNU 13.3.Rel1.
+# Call from ${OUTPUT_DIR}. Sets CROSS_COMPILE and prepends the bin directory to PATH.
+function ensure_atf_toolchain() {
+    local site_gcc="${SITE_TC_BIN}/${ARM_GNU_TRIPLE}-gcc"
+    local gcc="${PWD}/${ARM_GNU_DIR}/bin/${ARM_GNU_TRIPLE}-gcc"
+    local archive="${ARM_GNU_DIR}.tar.xz"
+    local bin_dir err
+
+    if gcc_runs "${site_gcc}"; then
+        bin_dir="${SITE_TC_BIN}"
+        echo "Using site toolchain: ${bin_dir}/${ARM_GNU_TRIPLE}-"
+    else
+        if [[ "$(uname -m)" != "x86_64" ]]; then
+            echo "ERROR: Arm GNU toolchain download is built for an x86_64 host (this host is $(uname -m))." >&2
+            exit 1
+        fi
+
+        echo "Site toolchain is not available; downloading Arm GNU toolchain ${ARM_GNU_VER} if needed."
+
+        if ! gcc_runs "${gcc}"; then
+            if [[ -d "${ARM_GNU_DIR}" ]]; then
+                echo "Removing incomplete toolchain ${ARM_GNU_DIR}"
+                rm -rf "${ARM_GNU_DIR}"
+            fi
+            if [[ -f "${archive}" ]] && ! xz -t "${archive}" >/dev/null 2>&1; then
+                echo "Removing invalid toolchain archive ${archive}"
+                rm -f "${archive}"
+            fi
+            if [[ ! -f "${archive}" ]]; then
+                echo "Downloading Arm GNU toolchain..."
+                if ! download "${ARM_GNU_URL}" "${archive}" || ! xz -t "${archive}" >/dev/null 2>&1; then
+                    rm -f "${archive}"
+                    echo "ERROR: failed to download the Arm GNU toolchain (${ARM_GNU_URL})" >&2
+                    exit 1
+                fi
+            fi
+            echo "Extracting Arm GNU toolchain..."
+            tar -xf "${archive}"
+        fi
+
+        if ! gcc_runs "${gcc}"; then
+            err="$("${gcc}" --version 2>&1 || true)"
+            echo "ERROR: ${gcc} does not run on this host." >&2
+            echo "${err}" >&2
+            exit 1
+        fi
+        bin_dir="${PWD}/${ARM_GNU_DIR}/bin"
+        echo "Using downloaded toolchain: ${bin_dir}/${ARM_GNU_TRIPLE}-"
+    fi
+
+    export CROSS_COMPILE="${bin_dir}/${ARM_GNU_TRIPLE}-"
+    export PATH="${bin_dir}:${PATH}"
 }
 
 # Install Zephyr SDK + aarch64-zephyr-elf toolchain.  Call from ${ZEPHYR_DIR}/zephyr
@@ -242,72 +325,22 @@ echo " Sample: ${ZEPHYR_SAMPLE}"
 echo "==============================================="
 echo
 
+ensure_download_proxy
+
 echo "[STEP] Setting up build environment (ATF)..."
 
 # Create and enter build directory
 mkdir -p "${OUTPUT_DIR}"
 cd "${OUTPUT_DIR}"
 
-# Set environment variables
 export ARCH=arm64
-# export CROSS_COMPILE="${PWD}/${TOOLCHAIN_DIR}/bin/aarch64-unknown-linux-musl-"
-# musl-cross host binaries need glibc >= 2.34, which this host lacks.
-declare -r SITE_TC_BIN="/nfs/site/disks/psg_ctools_1/arm_gnu/linaro/aarch64/13.3/1/bin"
-if [[ -x "${SITE_TC_BIN}/aarch64-none-linux-gnu-gcc" ]]; then
-    export CROSS_COMPILE="${SITE_TC_BIN}/aarch64-none-linux-gnu-"
-    export PATH="${SITE_TC_BIN}:${PATH}"
-else
-    export CROSS_COMPILE="${PWD}/${TOOLCHAIN_DIR}/bin/aarch64-unknown-linux-musl-"
-fi
+
+echo "[STEP] Setting up ARM GNU toolchain..."
+ensure_atf_toolchain
 
 echo "Build directory: ${PWD}"
 echo "Architecture: ${ARCH}"
 echo "Cross compiler: ${CROSS_COMPILE}"
-
-# =============================================================================
-# DOWNLOAD AND SETUP TOOLCHAIN
-# =============================================================================
-
-echo "[STEP] Setting up ARM GNU toolchain..."
-
-TOOLCHAIN_ARCHIVE="${TOOLCHAIN_DIR}.tar.xz"
-
-# The site Linaro compiler is used when present. The musl-cross binaries need
-# glibc >= 2.34, which is not available on the internal build hosts.
-if [[ -x "${CROSS_COMPILE}gcc" && "${CROSS_COMPILE}" != *"unknown-linux-musl-"* ]]; then
-    echo "Using site toolchain: ${CROSS_COMPILE}"
-else
-    if [[ ! -d "${TOOLCHAIN_DIR}" ]]; then
-        # A failed wget -O leaves a zero-length file, which must not be reused.
-        if [[ -f "${TOOLCHAIN_ARCHIVE}" ]] && ! xz -t "${TOOLCHAIN_ARCHIVE}" >/dev/null 2>&1; then
-            echo "Removing invalid toolchain archive ${TOOLCHAIN_ARCHIVE}"
-            rm -f "${TOOLCHAIN_ARCHIVE}"
-        fi
-
-        if [[ ! -f "${TOOLCHAIN_ARCHIVE}" ]]; then
-            echo "Downloading ARM GNU toolchain..."
-            if ! download "${TOOLCHAIN_URL}" "${TOOLCHAIN_ARCHIVE}" || ! xz -t "${TOOLCHAIN_ARCHIVE}" >/dev/null 2>&1; then
-                rm -f "${TOOLCHAIN_ARCHIVE}"
-                echo "ERROR: failed to download the ARM GNU toolchain (${TOOLCHAIN_URL})" >&2
-                exit 1
-            fi
-        fi
-
-        echo "Extracting ARM GNU toolchain..."
-        tar -xf "${TOOLCHAIN_ARCHIVE}"
-
-        if [[ ! -x "${TOOLCHAIN_DIR}/bin/aarch64-unknown-linux-musl-gcc" ]]; then
-            echo "ERROR: ARM toolchain verification failed" >&2
-            exit 1
-        fi
-
-        echo "ARM toolchain setup complete"
-    else
-        echo "ARM toolchain already downloaded"
-    fi
-
-    export PATH="${PWD}/${TOOLCHAIN_DIR}/bin:${PATH}"
-fi
 
 # =============================================================================
 # BUILD ARM TRUSTED FIRMWARE
@@ -330,9 +363,9 @@ declare -r BL31_BIN=${PWD}/build/agilex5/release/bl31.bin
 declare -r BL2_BIN=${PWD}/build/agilex5/release/bl2.bin
 declare -r BL2_HEX=${PWD}/build/agilex5/release/bl2.hex
 
-# bl2.hex is a raw-binary -> Intel-hex conversion, so any objcopy works. The
-# musl-cross host binaries need glibc >= 2.33 and won't run on SLES15.
-OBJCOPY_BIN="$(command -v aarch64-none-linux-gnu-objcopy || command -v objcopy)"
+# bl2.hex is a raw-binary -> Intel-hex conversion. Prefer the Arm GNU objcopy
+# from PATH (site tools or the downloaded toolchain); host objcopy can do this too.
+OBJCOPY_BIN="$(command -v ${ARM_GNU_TRIPLE}-objcopy || command -v objcopy)"
 echo "Using objcopy: ${OBJCOPY_BIN}"
 
 pushd "$(dirname ${BL2_BIN})"
